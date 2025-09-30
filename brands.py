@@ -21,6 +21,78 @@ try:
 except Exception:
     raise SystemExit("Install googlesearch-python: pip install googlesearch-python (or: pip install google)")
 
+# --- Search backends ---
+USE_DDG = True   # <<< set True to bypass googlesearch issues for now
+
+# Tolerant wrapper around googlesearch (handles different signatures)
+def gs_search(query: str, count: int, pause: float):
+    results = []
+    try:
+        # some forks use num_results=
+        for url in search(query, num_results=count, pause=pause, lang="en", tld="com", safe="off"):
+            results.append(url)
+        return results
+    except TypeError:
+        pass
+    try:
+        # others use num= (no stop=)
+        for url in search(query, num=count, pause=pause, lang="en", tld="com"):
+            results.append(url)
+        return results
+    except Exception as e:
+        print("googlesearch error:", e)
+        return results
+
+# DuckDuckGo HTML search (no API key)
+import httpx, urllib.parse
+from bs4 import BeautifulSoup
+
+def _unwrap_ddg_href(href: str) -> str | None:
+    # DDG returns //duckduckgo.com/l/?uddg=<encoded>
+    if "/l/?" in href and "uddg=" in href:
+        q = urllib.parse.urlsplit(href).query
+        params = urllib.parse.parse_qs(q)
+        if "uddg" in params and params["uddg"]:
+            return urllib.parse.unquote(params["uddg"][0])
+        return None
+    # or an absolute URL
+    if href.startswith("http"):
+        return href
+    return None
+
+def ddg_search(query: str, count: int = 20) -> list[str]:
+    # hit the HTML endpoint directly and follow redirects (302)
+    url = "https://html.duckduckgo.com/html/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = httpx.get(url, params={"q": query}, headers=headers,
+                      timeout=30, follow_redirects=True)
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "lxml")
+        out = []
+        # result links live in a.result__a (HTML SERP)
+        for a in soup.select("a.result__a"):
+            href = a.get("href")
+            if not href:
+                continue
+            real = _unwrap_ddg_href(href)
+            if real:
+                out.append(real)
+                if len(out) >= count:
+                    break
+        return out
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            print(f"🚫 DDG blocked query: {query[:50]}...")
+            return []
+        else:
+            print(f"❌ DDG HTTP error {e.response.status_code}: {query[:50]}...")
+            return []
+    except Exception as e:
+        print(f"❌ DDG error: {e}")
+        return []
+
 # =======================
 # CONFIG
 # =======================
@@ -36,36 +108,27 @@ BRANDS = [
 ]
 
 # How many results per query & how many query patterns per brand
-RESULTS_PER_QUERY   = 10           # 10–20 is a good start
-QUERIES_PER_BRAND   = 5            # number of patterns to run per brand
+RESULTS_PER_QUERY   = 5          # 10–20 is a good start
+QUERIES_PER_BRAND   = 3            # number of patterns to run per brand
 GOOGLE_PAUSE_SECS   = 3.5          # wait between requests to avoid captchas
 MAX_DOMAINS_PER_BRAND = 50         # cap to keep results manageable
 
 # Optional ZIPs to bias to US suppliers (will be mixed into queries at the end)
 ZIP_SEEDS = ["10001","90001","60601","77002","33101","85001","80202","98101","19103","30303"]
-USE_ZIPS  = True
+USE_ZIPS  = False
 ZIP_SAMPLES_PER_BRAND = 3          # how many ZIPs to add per brand
 
-# Query patterns (we’ll take the first QUERIES_PER_BRAND)
+# Query patterns (we'll take the first QUERIES_PER_BRAND)
 QUERY_PATTERNS = [
     '{brand} HVAC distributor',
-    '{brand} authorized dealer',
     '{brand} HVAC supplier',
-    '{brand} refrigeration distributor',
-    '{brand} "where to buy" HVAC',
-    '{brand} "find a dealer" HVAC',
-    '{brand} wholesale HVAC',
     '{brand} HVAC wholesaler',
-    '{brand} sales rep',
-    '{brand} representatives',
-    '{brand} contractors',
-    '{brand} parts distributor',
+    '{brand} authorized dealer',
     '{brand} "find a dealer"',
     '{brand} "where to buy"',
-    '{brand} "find a contractor"',
-    '{brand} "find a distributor"',
-
-
+    '{brand} sales rep',
+    '{brand} representatives',
+    '{brand} parts distributor',
 ]
 
 # Filter: domains to skip (noise) & words that suggest supplier relevance
@@ -87,9 +150,10 @@ OUT_XLSX = "supplier_urls_by_brand.xlsx"
 # =======================
 def likely_supplier_url(url: str) -> bool:
     u = url.lower()
-    if any(s in u for s in SKIP_DOMAIN_CONTAINS):
-        return False
-    return True  # keep everything else for discovery stage
+    bad = ["facebook.com","twitter.com","linkedin.com","instagram.com",
+           "youtube.com","indeed.com","glassdoor.com","ziprecruiter.com",
+           "wikipedia.org","amazon.com","ebay.com"]
+    return not any(b in u for b in bad)
 
 def dedupe_by_domain(urls: List[str]) -> List[str]:
     seen, out = set(), []
@@ -116,15 +180,9 @@ def discover_for_brand(brand: str) -> List[Dict[str, str]]:
 
     # Run each query
     for q in queries:
-        try:
-            for url in search(q, stop=RESULTS_PER_QUERY, pause=GOOGLE_PAUSE_SECS):
-                raw_urls.append(url)
-        except Exception as e:
-            print("Search error:", e)
-            time.sleep(6)
-        # Print raw results before filtering
-        print(f"Query: {q} -> {len(raw_urls)} raw URLs so far")
-        # Polite jitter between queries
+        urls = ddg_search(q, RESULTS_PER_QUERY) if USE_DDG else gs_search(q, RESULTS_PER_QUERY, GOOGLE_PAUSE_SECS)
+        print(f"Query: {q} -> RAW +{len(urls)}", urls[:5])
+        raw_urls.extend(urls)
         time.sleep(random.uniform(1.0, 2.0))
 
     # Filter & dedupe by domain
@@ -142,26 +200,40 @@ def discover_for_brand(brand: str) -> List[Dict[str, str]]:
         })
     return rows
 
+def write_outputs(rows: List[Dict[str, str]]) -> None:
+    df = pd.DataFrame(rows, columns=["Brand","Domain","URL","Query"])
+    df = df.sort_values(["Brand","Domain"]).reset_index(drop=True)
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+    df.to_excel(OUT_XLSX, index=False)
+
 # =======================
 # MAIN
 # =======================
 def main():
     all_rows: List[Dict[str, str]] = []
-    for brand in BRANDS:
-        print(f"[DISCOVER] {brand}")
-        rows = discover_for_brand(brand)
-        print(f"  -> {len(rows)} unique supplier domains")
-        all_rows.extend(rows)
+    
+    for i, brand in enumerate(BRANDS):
+        print(f"[DISCOVER] {brand} ({i+1}/{len(BRANDS)})")
+        try:
+            rows = discover_for_brand(brand)
+            print(f"  -> {len(rows)} unique supplier domains")
+            all_rows.extend(rows)
+            
+            # Save progress every 5 brands to avoid losing data
+            if (i + 1) % 5 == 0 or i == len(BRANDS) - 1:
+                print(f" Saving progress... ({len(all_rows)} total rows)")
+                write_outputs(all_rows)
+                
+        except KeyboardInterrupt:
+            print(f"\n Interrupted! Saving {len(all_rows)} rows collected so far...")
+            write_outputs(all_rows)
+            break
+        except Exception as e:
+            print(f" Error with {brand}: {e}")
+            continue
 
-    # Save
-    df = pd.DataFrame(all_rows, columns=["Brand","Domain","URL","Query"])
-    # Sort for readability
-    df = df.sort_values(["Brand","Domain"]).reset_index(drop=True)
-    df.to_csv(OUT_CSV, index=False, encoding="utf-8")
-    df.to_excel(OUT_XLSX, index=False)
-    print(f"\nSaved {len(df)} rows")
-    print(f"- {OUT_CSV}")
-    print(f"- {OUT_XLSX}")
+    print(f"\n Final save: {len(all_rows)} total rows")
+    write_outputs(all_rows)
 
 if __name__ == "__main__":
     main()
